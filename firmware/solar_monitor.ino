@@ -1,138 +1,160 @@
-﻿/*
- ============================================================================
-  PROJECT: IoT Solar Energy & Environmental Monitoring System
-  AUTHOR: Rachith Bharadwaj (https://github.com/Rachith000bharadwaj)
-  MICROCONTROLLER: ESP32 Dev Module
-  SENSORS:
-    - INA219 (Solar Panel Bus Voltage, Current & Power)
-    - ADS1115 (16-bit Precision ADC for solar irradiance / LDR)
-    - DS18B20 (Waterproof Temperature Probe for Panel Temperature)
- ============================================================================
-*/
+/*
+ * Corrected ESP32 Solar Monitor Firmware
+ * Hardware: INA219 (I2C 0x40), ADS1115 (I2C 0x48), DS18B20 (GPIO 4)
+ *
+ * Serial protocol retained for compatibility:
+ * CSV_ROW,Voltage_V,Current_mA,Power_mW,Energy_mWh,Temperature_C,ADC0
+ *
+ * Failed/unavailable sensors are emitted as -999 (or -1 for ADC), NOT zero.
+ */
 
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 #include <Adafruit_ADS1X15.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <math.h>
 
-// ESP32 Hardware Pin Assignments
-#define SDA_PIN 21
-#define SCL_PIN 22
-#define ONE_WIRE_BUS 4
+static constexpr uint8_t SDA_PIN = 21;
+static constexpr uint8_t SCL_PIN = 22;
+static constexpr uint8_t ONE_WIRE_PIN = 4;
+static constexpr uint8_t INA219_ADDRESS = 0x40;
+static constexpr uint8_t ADS1115_ADDRESS = 0x48;
+static constexpr float INVALID_FLOAT = -999.0f;
+static constexpr int16_t INVALID_ADC = -1;
+static constexpr uint32_t SAMPLE_INTERVAL_MS = 2000;
 
-Adafruit_INA219 ina219;
+Adafruit_INA219 ina219(INA219_ADDRESS);
 Adafruit_ADS1115 ads;
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
+OneWire oneWire(ONE_WIRE_PIN);
+DallasTemperature ds18b20(&oneWire);
 
-bool ina_ok = false;
-bool ads_ok = false;
-bool ds_ok  = false;
+bool inaReady = false;
+bool adsReady = false;
+bool tempReady = false;
+float totalEnergy_mWh = 0.0f;
+uint32_t previousSampleMs = 0;
 
-// Energy Accumulation (mWh)
-float total_energy_mwh = 0.0;
-unsigned long last_time = 0;
+bool i2cDevicePresent(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+void scanI2CBus() {
+  Serial.println("[DIAG] Scanning I2C bus...");
+  uint8_t found = 0;
+  for (uint8_t address = 1; address < 127; ++address) {
+    Wire.beginTransmission(address);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf("[I2C] Device found at 0x%02X\n", address);
+      ++found;
+    }
+  }
+  if (found == 0) {
+    Serial.println("[I2C][ERROR] No devices found. Check 3V3, GND, SDA=GPIO21, SCL=GPIO22 and solder joints.");
+  }
+  if (!i2cDevicePresent(INA219_ADDRESS))
+    Serial.println("[I2C][ERROR] INA219 expected at 0x40 not detected.");
+  if (!i2cDevicePresent(ADS1115_ADDRESS))
+    Serial.println("[I2C][ERROR] ADS1115 expected at 0x48 not detected; check ADDR strap (GND=0x48).");
+}
+
+void initializeSensors() {
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(50);
+  scanI2CBus();
+
+  inaReady = ina219.begin();
+  if (inaReady) {
+    ina219.setCalibration_32V_2A();
+    Serial.println("[SYSTEM] INA219 initialized at 0x40.");
+  } else {
+    Serial.println("[SYSTEM][ERROR] INA219 initialization failed; power readings invalid.");
+  }
+
+  adsReady = ads.begin(ADS1115_ADDRESS, &Wire);
+  if (adsReady) {
+    ads.setGain(GAIN_ONE);
+    Serial.println("[SYSTEM] ADS1115 initialized at 0x48.");
+  } else {
+    Serial.println("[SYSTEM][ERROR] ADS1115 initialization failed; ADC invalid.");
+  }
+
+  ds18b20.begin();
+  ds18b20.setResolution(12);
+  const int deviceCount = ds18b20.getDeviceCount();
+  tempReady = deviceCount > 0;
+  if (tempReady) {
+    Serial.printf("[SYSTEM] DS18B20 detected: %d device(s) on GPIO %u.\n", deviceCount, ONE_WIRE_PIN);
+  } else {
+    Serial.println("[SYSTEM][ERROR] No DS18B20. Check probe polarity, GPIO4 DATA, common GND and 4.7k pull-up to 3V3.");
+  }
+}
 
 void setup() {
   Serial.begin(115200);
-  delay(1500);
-
-  Serial.println("\n========================================================");
-  Serial.println("     SOLAR ENERGY & ENVIRONMENTAL MONITORING SYSTEM     ");
-  Serial.println("========================================================");
-
-  // Initialize I2C Bus on GPIO21 (SDA) and GPIO22 (SCL)
-  Wire.begin(SDA_PIN, SCL_PIN);
-
-  // 1. Initialize INA219 Power Sensor
-  if (ina219.begin()) {
-    ina_ok = true;
-    Serial.println("[SYSTEM] INA219 Solar Sensor: CONNECTED");
-  } else {
-    Serial.println("[SYSTEM] INA219: NOT DETECTED (Check 3V3, GND, D21, D22)");
-  }
-
-  // 2. Initialize ADS1115 16-Bit ADC
-  if (ads.begin(0x48)) {
-    ads_ok = true;
-    Serial.println("[SYSTEM] ADS1115 16-Bit ADC: CONNECTED");
-  } else {
-    Serial.println("[SYSTEM] ADS1115: NOT DETECTED (Check 3V3, GND, D21, D22)");
-  }
-
-  // 3. Initialize DS18B20 Temperature Probe
-  sensors.begin();
-  if (sensors.getDeviceCount() > 0) {
-    ds_ok = true;
-    Serial.println("[SYSTEM] DS18B20 Temperature Probe: CONNECTED");
-  } else {
-    Serial.println("[SYSTEM] DS18B20: NOT DETECTED (Check Yellow=D4, 4.7k resistor)");
-  }
-
-  Serial.println("========================================================");
-  Serial.println("Starting live solar measurements...\n");
-  last_time = millis();
+  delay(1200);
+  Serial.println();
+  Serial.println("=== ESP32 SOLAR MONITOR / SENSOR DIAGNOSTICS ===");
+  initializeSensors();
+  Serial.println("[SYSTEM] CSV output begins below. Serial Monitor: 115200 baud.");
+  previousSampleMs = millis();
 }
 
 void loop() {
-  unsigned long current_time = millis();
-  float delta_hours = (current_time - last_time) / 3600000.0;
-  last_time = current_time;
+  const uint32_t now = millis();
+  const float elapsedHours = (now - previousSampleMs) / 3600000.0f;
+  previousSampleMs = now;
 
-  float bus_voltage_V = 0.0;
-  float current_mA    = 0.0;
-  float power_mW      = 0.0;
-  float temp_C        = -999.0;
-  int16_t a0_val = 0;
+  float busVoltage_V = INVALID_FLOAT;
+  float current_mA = INVALID_FLOAT;
+  float power_mW = INVALID_FLOAT;
+  float temperature_C = INVALID_FLOAT;
+  int16_t adc0 = INVALID_ADC;
 
-  // 1. Read Solar Power from INA219
-  if (ina_ok) {
-    bus_voltage_V = ina219.getBusVoltage_V();
-    current_mA    = ina219.getCurrent_mA();
-    power_mW      = ina219.getPower_mW();
-
-    // Prevent noise readings in low light
-    if (bus_voltage_V < 0.05) bus_voltage_V = 0.0;
-    if (current_mA < 0.1) current_mA = 0.0;
-    if (power_mW < 0.1) power_mW = 0.0;
-
-    total_energy_mwh += (power_mW * delta_hours);
+  if (inaReady) {
+    const float v = ina219.getBusVoltage_V();
+    const float i = ina219.getCurrent_mA();
+    const float p = ina219.getPower_mW();
+    if (isfinite(v) && isfinite(i) && isfinite(p)) {
+      busVoltage_V = v;
+      current_mA = i;
+      power_mW = p;
+      if (power_mW > 0.0f && elapsedHours > 0.0f)
+        totalEnergy_mWh += power_mW * elapsedHours;
+    } else {
+      Serial.println("[READ][ERROR] INA219 returned non-finite reading.");
+    }
   }
 
-  // 2. Read ADS1115 Irradiance / Light Channel
-  if (ads_ok) {
-    a0_val = ads.readADC_SingleEnded(0);
+  if (adsReady) {
+    adc0 = ads.readADC_SingleEnded(0);
   }
 
-  // 3. Read Temperature from DS18B20
-  if (ds_ok) {
-    sensors.requestTemperatures();
-    temp_C = sensors.getTempCByIndex(0);
+  if (tempReady) {
+    ds18b20.requestTemperatures();
+    const float t = ds18b20.getTempCByIndex(0);
+    if (t != DEVICE_DISCONNECTED_C && isfinite(t) && t >= -55.0f && t <= 125.0f) {
+      temperature_C = t;
+    } else {
+      Serial.println("[READ][ERROR] DS18B20 disconnected or invalid; check data and pull-up.");
+    }
   }
 
-  // Display Friendly Console Output
-  Serial.println("----------------- [SOLAR DATA] -----------------");
-  Serial.print("Solar Voltage : "); Serial.print(bus_voltage_V, 3); Serial.println(" V");
-  Serial.print("Solar Current : "); Serial.print(current_mA, 2);    Serial.println(" mA");
-  Serial.print("Solar Power   : "); Serial.print(power_mW, 2);       Serial.println(" mW");
-  Serial.print("Total Energy  : "); Serial.print(total_energy_mwh, 3); Serial.println(" mWh");
-  
-  if (ds_ok && temp_C != -127.0 && temp_C > -50.0) {
-    Serial.print("Temperature   : "); Serial.print(temp_C, 2); Serial.println(" °C");
-  } else {
-    Serial.println("Temperature   : Sensor not detected");
-  }
-  Serial.println("------------------------------------------------\n");
+  Serial.printf("[STATUS] INA219=%s ADS1115=%s DS18B20=%s\n",
+                inaReady ? "OK" : "MISSING",
+                adsReady ? "OK" : "MISSING",
+                tempReady ? "OK" : "MISSING");
 
-  // Output formatted CSV row: CSV_ROW,Voltage,Current,Power,Energy,Temp,A0
+  // Fixed seven-field row consumed by logger/data_logger.py.
   Serial.print("CSV_ROW,");
-  Serial.print(bus_voltage_V, 3); Serial.print(",");
-  Serial.print(current_mA, 2);    Serial.print(",");
-  Serial.print(power_mW, 2);      Serial.print(",");
-  Serial.print(total_energy_mwh, 3); Serial.print(",");
-  Serial.print(temp_C, 2);        Serial.print(",");
-  Serial.println(a0_val);
+  Serial.print(busVoltage_V, 3); Serial.print(',');
+  Serial.print(current_mA, 2); Serial.print(',');
+  Serial.print(power_mW, 2); Serial.print(',');
+  Serial.print(totalEnergy_mWh, 3); Serial.print(',');
+  Serial.print(temperature_C, 2); Serial.print(',');
+  Serial.println(adc0);
 
-  delay(2000); // 2-second sampling interval
+  delay(SAMPLE_INTERVAL_MS);
 }
