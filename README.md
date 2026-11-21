@@ -1,102 +1,93 @@
-﻿# IoT Solar Energy & Environmental Monitoring System ☀️📊
+# ESP32 Solar Energy & Environmental Monitoring
 
-A complete Internet of Things (IoT) hardware and software solution to monitor, measure, and record solar panel power generation and environmental conditions in real time.
+ESP32 firmware and USB serial logger for INA219, ADS1115 and DS18B20 modules.
 
-**Author:** [Rachith Bharadwaj](https://github.com/Rachith000bharadwaj)
+## Hardware wiring
 
----
+| Module | Module pin | ESP32 |
+|---|---|---|
+| INA219 | VCC / GND | 3V3 / GND |
+| INA219 | SDA / SCL | GPIO21 / GPIO22 |
+| ADS1115 | VDD / GND | 3V3 / GND |
+| ADS1115 | SDA / SCL | GPIO21 / GPIO22 |
+| DS18B20 | Red / Black / Yellow | 3V3 / GND / GPIO4 |
 
-## 📌 Project Overview
-This project continuously measures:
-- **Solar Panel Bus Voltage ($V$)**
-- **Solar Current Flow ($mA$)**
-- **Solar Power Output ($mW$)**
-- **Cumulative Solar Energy Generated ($mWh$)**
-- **Solar Panel / Ambient Temperature ($^\circ C$)**
-- **16-bit Solar Radiation / Light Intensity ($ADC$)**
+Install a 4.7 kOhm pull-up between DS18B20 DATA (GPIO4) and 3V3. Share GND across all modules. Expected I2C addresses: INA219 0x40, ADS1115 0x48 (ADDR tied to GND). Update firmware constants if address straps differ.
 
-All telemetry is streamed from an **ESP32** microcontroller over USB Serial and automatically recorded with exact PC timestamps into a real-time **CSV file** on your computer.
+## Electrical safety and INA219
 
----
+For high-side current sensing, connect source positive to INA219 VIN+, then VIN- to load positive. Source negative and ESP32 GND must be common. Verify solar panel open-circuit voltage and module/shunt ratings before connecting. Never exceed module voltage/current ratings. Firmware uses Adafruit INA219 32V/2A calibration; this must match the actual module shunt/current range.
 
-## 🛠️ Hardware Components
-1. **ESP32 Dev Module (30 or 38-Pin)**
-2. **INA219 High-Side DC Voltage & Current Sensor Module**
-3. **ADS1115 16-Bit I2C ADC Module**
-4. **DS18B20 Waterproof Temperature Sensor Probe**
-5. **Solar Panel** (DC Voltage up to 26V)
-6. **Load Resistor / Power Load**
-7. **4.7 kΩ Resistor** (1-Wire Pull-up)
-8. **Breadboard & Jumper Wires**
+## Upload firmware
 
----
+Open firmware/solar_monitor.ino in Arduino IDE. Select correct ESP32 board and serial port. Install Adafruit INA219, Adafruit ADS1X15, OneWire and DallasTemperature libraries. Open Serial Monitor at 115200 baud. At boot, firmware scans I2C and reports each sensor initialization.
 
-## 🔌 Circuit Wiring & Pinout
+## Serial data protocol
 
-### 1. Sensor to ESP32 Connections (3.3V Power & I2C Bus)
-| Sensor | Sensor Pin | ESP32 Pin | Purpose |
-| :--- | :--- | :--- | :--- |
-| **INA219** | VCC | 3V3 | Power (3.3V) |
-| **INA219** | GND | GND | Ground |
-| **INA219** | SDA | GPIO 21 (D21) | I2C Data Line |
-| **INA219** | SCL | GPIO 22 (D22) | I2C Clock Line |
-| **ADS1115** | VDD | 3V3 | Power (3.3V) |
-| **ADS1115** | GND | GND | Ground |
-| **ADS1115** | SDA | GPIO 21 (D21) | Shared I2C Data |
-| **ADS1115** | SCL | GPIO 22 (D22) | Shared I2C Clock |
-| **DS18B20** | Red Wire | 3V3 | Power (3.3V) |
-| **DS18B20** | Black Wire | GND | Ground |
-| **DS18B20** | Yellow Wire | GPIO 4 (D4) | 1-Wire Data Line |
+Every approximately 2 seconds, firmware emits:
 
-> **IMPORTANT:** Connect a **4.7 kΩ pull-up resistor** between **DS18B20 Yellow (D4)** and **3V3**.
-
-### 2. Solar Panel & Load Circuit (High-Side Current Sensing)
-```
-[ SOLAR PANEL ]
-  (+) Red Wire   ─────────► INA219 [ Vin+ ] (Screw terminal)
-  
-                            INA219 [ Vin- ] (Screw terminal)
-                               │
-                               ▼
-                           (+) Positive of Load Resistor
-                           (-) Negative of Load Resistor ───┐
-                                                            │
-  (-) Black Wire ───────────────────────────────────────────┴──► ESP32 GND
+```text
+CSV_ROW,Voltage_V,Current_mA,Power_mW,Energy_mWh,Temperature_C,ADC0
 ```
 
-> **CRITICAL NOTE:** The pin headers on the INA219 and ADS1115 must be **soldered** to the PCB boards to guarantee electrical continuity.
+Unavailable float readings use -999; unavailable ADC uses -1. These sentinels distinguish sensor failure from a genuine zero. Python logger converts sentinels to blank CSV fields but preserves valid zero readings.
 
----
+## Diagnose missing modules
 
-## 💻 Software Setup
+Flash diagnostics/i2c_scanner.ino if main firmware does not detect INA219/ADS1115. Expected addresses are 0x40 and 0x48. If missing, inspect 3V3, GND, SDA/SCL, soldered headers and address straps. An I2C ACK does not prove the sensor is producing correct measurements.
 
-### 1. Arduino IDE Setup
-1. Install **Arduino IDE 2.x**.
-2. Go to **File → Preferences** and add the ESP32 Board URL:
-   ```text
-   https://espressif.github.io/arduino-esp32/package_esp32_index.json
-   ```
-3. Go to **Tools → Board → Boards Manager**, search for `esp32`, and install `esp32 by Espressif Systems`.
-4. Install the following libraries via **Sketch → Include Library → Manage Libraries**:
-   - `Adafruit INA219`
-   - `Adafruit ADS1X15`
-   - `OneWire`
-   - `DallasTemperature`
-5. Open `firmware/solar_monitor.ino`, select **ESP32 Dev Module** and your **COM Port**, then click **Upload (➡️)**.
+For DS18B20, check probe polarity, GPIO4 data and the 4.7 kOhm pull-up. A detected probe can still fail temperature conversion; main firmware reports read errors separately.
 
-### 2. Real-Time CSV Data Logger (Python)
-Install requirements:
+## Run USB serial CSV logger
+
+Python 3.9+:
+
 ```bash
-pip install -r requirements.txt
+python -m venv .venv
+# Windows: .venv\\Scripts\\activate
+# Linux/macOS: source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-Run the logger:
+With exactly one serial port connected:
+
 ```bash
-python data_logger.py
+python logger/data_logger.py
 ```
-A live CSV file named `solar_realtime_data.csv` will be created and updated every 2 seconds with timestamps.
 
----
+Or specify a port:
 
-## 📄 License
-This project is licensed under the MIT License.
+```bash
+python logger/data_logger.py --port COM5
+python logger/data_logger.py --port /dev/ttyUSB0 --output logs/solar.csv
+```
+
+Close Arduino Serial Monitor before launching the logger because only one application can generally own the serial port. Stop with Ctrl+C. Output defaults to solar_realtime_data.csv with UTC timestamps. Diagnostic lines are printed but not written as data rows.
+
+## Parser tests (no hardware required)
+
+```bash
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+Tests cover genuine zero values, failed-sensor sentinels, ignored diagnostic lines and malformed row rejection.
+
+## Hardware validation checklist
+
+- [ ] Compile firmware in Arduino IDE using the libraries above and selected ESP32 board.
+- [ ] Confirm I2C scan sees both expected addresses on the actual board.
+- [ ] Confirm DS18B20 is found and returns plausible temperature.
+- [ ] Compare INA219 against a trusted meter with a known, safe test load.
+- [ ] Apply a known ADS1115 input voltage within ADC input limits and confirm response.
+- [ ] Run Python logger and inspect generated CSV.
+
+This update is source-code and parser-tested. It has not been physically tested against an ESP32, sensor modules, solar panel or load circuit. Do not claim hardware operation until the checklist is completed.
+
+## Project layout
+
+- firmware/solar_monitor.ino — main ESP32 firmware.
+- diagnostics/i2c_scanner.ino — standalone I2C scanner.
+- logger/data_logger.py — USB serial CSV logger.
+- tests/test_logger.py — parser unit tests.
+- requirements.txt — Python dependency.
